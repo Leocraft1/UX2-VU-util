@@ -34,7 +34,7 @@
 #include <spa/utils/result.h>
 
 /* ---------------------------------------------------------------------
- * Parte USB (Line6 UX2) - stessa logica del programma CLI gia' scritto
+ * USB section (Line6 UX2) - same logic as the CLI tool already written
  * --------------------------------------------------------------------- */
 
 #define VID 0x0e41
@@ -82,7 +82,7 @@ static int send_vu(libusb_device_handle *dev, int left, int right){
 
     if (r < 0)
     {
-        fprintf(stderr, "VU: control transfer fallito: %s (%d)\n",
+        fprintf(stderr, "VU: control transfer failed: %s (%d)\n",
                 libusb_error_name(r), r);
         return -1;
     }
@@ -131,7 +131,7 @@ static int dbfs_to_vu(double dbfs){
 static double peak_to_dbfs(float peak){
     if (peak <= 0.0f)
     {
-        return -120.0; /* silenzio assoluto */
+        return -120.0; /* absolute silence */
     }
     return 20.0 * log10((double)peak);
 }
@@ -147,7 +147,7 @@ static _Atomic int g_running = 1;
 //Update peak only if higher than previous 
 static void atomic_update_peak(_Atomic float *slot, float value){
     float cur = atomic_load_explicit(slot, memory_order_relaxed);
-    while (value > cur && !atomic_compare_exchange_weak_explicit(slot, &cur, value,memory_order_relaxed, memory_order_relaxed)){/* cur viene aggiornato da compare_exchange, riprova */}
+    while (value > cur && !atomic_compare_exchange_weak_explicit(slot, &cur, value,memory_order_relaxed, memory_order_relaxed)){/* cur is updated by compare_exchange, retry */}
 }
 
 struct pw_data{
@@ -159,6 +159,7 @@ struct pw_data{
 static _Atomic int g_sender_started = 0;
 
 static void *vu_sender_thread(void *arg);
+static void vu_anim(void);
 
 static uint64_t g_process_calls = 0;
 
@@ -184,7 +185,7 @@ static void on_process(void *userdata){
     }
 
     samples = (float *)buf->datas[0].data;
-    /* assumiamo layout interleaved float32, 2 canali (impostato nel format) */
+    /* assuming interleaved float32 layout, 2 channels (set in the format) */
     n_channels = 2;
     n_samples = buf->datas[0].chunk->size / sizeof(float) / n_channels;
 
@@ -222,7 +223,7 @@ static void on_state_changed(void *userdata, enum pw_stream_state old, enum pw_s
     fprintf(stderr, "[pipewire] stream state: %s -> %s%s%s\n",
         pw_stream_state_as_string(old),
         pw_stream_state_as_string(state),
-        error ? "  ERRORE: " : "",
+        error ? "  ERROR: " : "",
         error ? error : "");
 
     if (state == PW_STREAM_STATE_STREAMING && !atomic_load_explicit(&g_sender_started, memory_order_relaxed)){
@@ -271,6 +272,12 @@ static const struct pw_stream_events stream_events = {
 static void *vu_sender_thread(void *arg){
     (void)arg;
 
+    /* Startup animation runs once here: usb_dev is guaranteed valid at
+     * this point (this thread is only started after open_ux2()
+     * succeeded), and running it in this separate thread means it
+     * doesn't block the PipeWire main loop. */
+    vu_anim();
+
     while (atomic_load_explicit(&g_running, memory_order_relaxed)){
         //Calculates peak level
         float peak_l = atomic_exchange_explicit(&g_peak_left, 0.0f, memory_order_relaxed);
@@ -284,17 +291,17 @@ static void *vu_sender_thread(void *arg){
         int vu_l = dbfs_to_vu(dbfs_l);
         int vu_r = dbfs_to_vu(dbfs_r);
 
-        int r1 = send_peak(usb_dev, 2);
-        int r2 = send_vu(usb_dev, vu_l, vu_r);
+        //Maps L/R clip state to the 4 states: 1=none 2=left 3=right 4=both
+        int clip_l = (peak_l >= 1.0f);
+        int clip_r = (peak_r >= 1.0f);
+        int clip_stat;
+        if (clip_l && clip_r)      clip_stat = 4;
+        else if (clip_r)           clip_stat = 3;
+        else if (clip_l)           clip_stat = 2;
+        else                        clip_stat = 1;
 
-        /* DEBUG */
-        /*
-        fprintf(stderr,
-                "[usb] peak L=%.4f R=%.4f  dBFS L=%.1f R=%.1f  VU L=%d R=%d  "
-                "keepalive=%s vu_send=%s\n",
-                peak_l, peak_r, dbfs_l, dbfs_r, vu_l, vu_r,
-                r1 == 0 ? "ok" : "FALLITA",
-                r2 == 0 ? "ok" : "FALLITA");*/
+        send_peak(usb_dev, clip_stat);
+        send_vu(usb_dev, vu_l, vu_r);
 
         usleep(REF_RATE_MS * 1000);
     }
@@ -302,35 +309,35 @@ static void *vu_sender_thread(void *arg){
     return NULL;
 }
 
-//Shutdown task, sets meters to zero and removes clip indicator
-static void *vu_anim(){
-    int vu_l = 140;
-    int vu_r = 140;
+// Startup animation
+static void vu_anim(void){
+    //Vu at max scale and all LED on
+    int r1 = send_peak(usb_dev, 4);
+    int r2 = send_vu(usb_dev, VU_MAX, VU_MAX);
 
-    int r1 = send_peak(usb_dev, 2);
-    usleep(1000 * 1000);
-    int r2 = send_vu(usb_dev, vu_l, vu_r);
-    usleep(1000);
+    usleep(800 * 1000);
+
+    //Turn everything off
     int r3 = send_peak(usb_dev, 1);
+    int r4 = send_vu(usb_dev, 0, 0);
 
     fprintf(stderr,
-        "[usb] Started meters\n",
-        r1 == 0 ? "ok" : "FALLITA",
-        r2 == 0 ? "ok" : "FALLITA");
+        "[usb] Startup animation done (clip_on=%s vu_on=%s clip_off=%s vu_off=%s)\n",
+        r1 == 0 ? "ok" : "FAILED",
+        r2 == 0 ? "ok" : "FAILED",
+        r3 == 0 ? "ok" : "FAILED",
+        r4 == 0 ? "ok" : "FAILED");
 }
 
-//Shutdown task, sets meters to zero and removes clip indicator
-static void *vu_zero(){
-    int vu_l = 0;
-    int vu_r = 0;
-
+/* Shutdown task: sets meters to zero and turns off the clip indicator */
+static void vu_zero(void){
     int r1 = send_peak(usb_dev, 1);
-    int r2 = send_vu(usb_dev, vu_l, vu_r);
+    int r2 = send_vu(usb_dev, 0, 0);
 
     fprintf(stderr,
-        "[usb] Meters set to zero\n",
-        r1 == 0 ? "ok" : "FALLITA",
-        r2 == 0 ? "ok" : "FALLITA");
+        "[usb] Meters set to zero (clip=%s vu=%s)\n",
+        r1 == 0 ? "ok" : "FAILED",
+        r2 == 0 ? "ok" : "FAILED");
 }
 
 static struct pw_main_loop *g_pw_loop = NULL;
@@ -355,6 +362,7 @@ int main(int argc, char *argv[]){
     int r;
 
     signal(SIGINT, handle_sigint);
+    signal(SIGTERM, handle_sigint);
 
     //init PipeWire
     pw_init(&argc, &argv);
@@ -369,8 +377,8 @@ int main(int argc, char *argv[]){
             PW_KEY_MEDIA_TYPE, "Audio",
             PW_KEY_MEDIA_CATEGORY, "Capture",
             PW_KEY_MEDIA_ROLE, "Music",
-            /* Cattura automaticamente il monitor del sink predefinito
-             * (EasyEffects o UX2 in base a cosa e' attivo nel sistema) */
+            /* Automatically captures the default sink's monitor
+             * (EasyEffects or UX2, whichever is currently active) */
             PW_KEY_STREAM_CAPTURE_SINK, "true",
             NULL),
         &stream_events,
@@ -393,19 +401,18 @@ int main(int argc, char *argv[]){
         params, 1);
 
     if (r < 0){
-        fprintf(stderr, "[pipewire] pw_stream_connect fallito: %s (%d)\n",
+        fprintf(stderr, "[pipewire] pw_stream_connect failed: %s (%d)\n",
                 spa_strerror(r), r);
         return 1;
     }
-    fprintf(stderr, "[pipewire] pw_stream_connect chiamata con successo, "
-                    "in attesa che lo stream si colleghi...\n");
+    fprintf(stderr, "[pipewire] pw_stream_connect call succeeded, "
+                    "waiting for stream to connect...\n");
 
-    /* il thread di invio USB parte da solo quando lo stream PipeWire
-     * raggiunge lo stato STREAMING (vedi on_state_changed) */
-    printf("In ascolto del monitor del sink di default. Ctrl+C per uscire.\n");
+    /* the USB sender thread starts on its own once the PipeWire stream
+     * reaches STREAMING (see on_state_changed) */
+    printf("Listening to default sink monitor. Press Ctrl+C to exit.\n");
 
     pw_main_loop_run(data.loop);
-    //vu_anim();
 
     /* --- shutdown --- */
     atomic_store_explicit(&g_running, 0, memory_order_relaxed);

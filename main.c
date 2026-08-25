@@ -54,30 +54,24 @@
 static libusb_context *usb_ctx = NULL;
 static libusb_device_handle *usb_dev = NULL;
 
-static libusb_device_handle *open_ux2(libusb_context *ctx)
-{
+static libusb_device_handle *open_ux2(libusb_context *ctx){
     libusb_device_handle *dev = libusb_open_device_with_vid_pid(ctx, VID, PID);
     if (!dev)
     {
-        fprintf(stderr, "Impossibile aprire la UX2 (%04x:%04x)\n", VID, PID);
+        fprintf(stderr, "Unable to open UX2 device (%04x:%04x)\n", VID, PID);
         return NULL;
     }
     return dev;
 }
 
-static int send_vu(libusb_device_handle *dev, int left, int right)
-{
+static int send_vu(libusb_device_handle *dev, int left, int right){
     uint16_t wIndex;
     int r;
 
-    if (left < VU_MIN)
-        left = VU_MIN;
-    if (left > VU_MAX)
-        left = VU_MAX;
-    if (right < VU_MIN)
-        right = VU_MIN;
-    if (right > VU_MAX)
-        right = VU_MAX;
+    if (left < VU_MIN) left = VU_MIN;
+    if (left > VU_MAX) left = VU_MAX;
+    if (right < VU_MIN) right = VU_MIN;
+    if (right > VU_MAX) right = VU_MAX;
 
     /* wIndex = RRLL */
     wIndex = ((uint16_t)right << 8) | (uint16_t)left;
@@ -95,15 +89,14 @@ static int send_vu(libusb_device_handle *dev, int left, int right)
     return 0;
 }
 
-/* pacchetto "costante" osservato in ogni ciclo di 45ms nel dump originale */
-static int send_peak(libusb_device_handle *dev, int val)
-{
+//Drives Clip LEDs
+static int send_peak(libusb_device_handle *dev, int val){
     int r = libusb_control_transfer(
         dev, BM_REQUEST_TYPE, B_REQUEST,
-        CLIP_WVALUE, 0x0001, NULL, 0, 1000);
+        CLIP_WVALUE, val, NULL, 0, 1000);
     if (r < 0)
     {
-        fprintf(stderr, "KEEPALIVE: control transfer fallito: %s (%d)\n",
+        fprintf(stderr, "Clip LEDs: control transfer failed: %s (%d)\n",
                 libusb_error_name(r), r);
         return -1;
     }
@@ -111,37 +104,31 @@ static int send_peak(libusb_device_handle *dev, int val)
 }
 
 /* ---------------------------------------------------------------------
- * Conversione livello -> valore raw VU (fit trovato dai dati di calibrazione)
- *   valore = A * 10^(dB/20) + B*dB + C
+ * LEVELS CONVERSION SECTION - Translates values into UX2 VU values
+ * FORMULA: value = A * 10^(dB/20) + B*dB + C
  * --------------------------------------------------------------------- */
 
 #define CAL_A 49.28
 #define CAL_B 1.252
-#define CAL_C 87.39
+#define CAL_C 87.59
 
-static int dbfs_to_vu(double dbfs)
-{
+static int dbfs_to_vu(double dbfs){
     double v;
 
-    if (dbfs < -90.0)
-    {
-        /* sotto il fondo scala meccanico misurato (-66dBFS -> 4):
-         * consideriamo silenzio elettrico */
+    if (dbfs < -67.0){
+        //Needle is off scale
         return 0;
     }
 
     v = CAL_A * pow(10.0, dbfs / 20.0) + CAL_B * dbfs + CAL_C;
 
-    if (v < 0)
-        v = 0;
-    if (v > VU_MAX)
-        v = VU_MAX;
+    if (v < 0) v = 0;
+    if (v > VU_MAX) v = VU_MAX;
 
     return (int)lround(v);
 }
 
-static double peak_to_dbfs(float peak)
-{
+static double peak_to_dbfs(float peak){
     if (peak <= 0.0f)
     {
         return -120.0; /* silenzio assoluto */
@@ -150,29 +137,20 @@ static double peak_to_dbfs(float peak)
 }
 
 /* ---------------------------------------------------------------------
- * Parte audio (PipeWire) - cattura del monitor del sink di default
+ * AUDIO SECTION (PipeWire) - Captures from deafult sink monitor
  * --------------------------------------------------------------------- */
 
 static _Atomic float g_peak_left = 0.0f;
 static _Atomic float g_peak_right = 0.0f;
 static _Atomic int g_running = 1;
 
-/* aggiorna il picco atomico solo se il nuovo valore e' piu' alto
- * (viene azzerato dal thread timer ogni ~45ms) */
-static void atomic_update_peak(_Atomic float *slot, float value)
-{
+//Update peak only if higher than previous 
+static void atomic_update_peak(_Atomic float *slot, float value){
     float cur = atomic_load_explicit(slot, memory_order_relaxed);
-    while (value > cur &&
-           !atomic_compare_exchange_weak_explicit(
-               slot, &cur, value,
-               memory_order_relaxed, memory_order_relaxed))
-    {
-        /* cur viene aggiornato da compare_exchange, riprova */
-    }
+    while (value > cur && !atomic_compare_exchange_weak_explicit(slot, &cur, value,memory_order_relaxed, memory_order_relaxed)){/* cur viene aggiornato da compare_exchange, riprova */}
 }
 
-struct pw_data
-{
+struct pw_data{
     struct pw_main_loop *loop;
     struct pw_stream *stream;
     pthread_t sender_tid;
@@ -184,8 +162,7 @@ static void *vu_sender_thread(void *arg);
 
 static uint64_t g_process_calls = 0;
 
-static void on_process(void *userdata)
-{
+static void on_process(void *userdata){
     struct pw_data *data = userdata;
     struct pw_buffer *b;
     struct spa_buffer *buf;
@@ -239,31 +216,21 @@ static void on_process(void *userdata)
     pw_stream_queue_buffer(data->stream, b);
 }
 
-static void on_state_changed(void *userdata, enum pw_stream_state old,
-                             enum pw_stream_state state, const char *error)
-{
+static void on_state_changed(void *userdata, enum pw_stream_state old, enum pw_stream_state state, const char *error){
     struct pw_data *data = userdata;
     (void)userdata;
-    fprintf(stderr, "[pipewire] stato stream: %s -> %s%s%s\n",
-            pw_stream_state_as_string(old),
-            pw_stream_state_as_string(state),
-            error ? "  ERRORE: " : "",
-            error ? error : "");
+    fprintf(stderr, "[pipewire] stream state: %s -> %s%s%s\n",
+        pw_stream_state_as_string(old),
+        pw_stream_state_as_string(state),
+        error ? "  ERRORE: " : "",
+        error ? error : "");
 
-    if (state == PW_STREAM_STATE_STREAMING &&
-        !atomic_load_explicit(&g_sender_started, memory_order_relaxed))
-    {
-
+    if (state == PW_STREAM_STATE_STREAMING && !atomic_load_explicit(&g_sender_started, memory_order_relaxed)){
         int ur;
 
-        /* SOLO ora, a stream audio gia' negoziato e attivo,
-         * inizializziamo libusb e apriamo la UX2. Farlo prima
-         * (anche solo libusb_init(), senza aprire nulla) causa
-         * il fallimento della negoziazione PipeWire/ALSA. */
         ur = libusb_init(&usb_ctx);
-        if (ur != 0)
-        {
-            fprintf(stderr, "libusb_init fallita: %s\n", libusb_error_name(ur));
+        if (ur != 0){
+            fprintf(stderr, "libusb_init failed: %s\n", libusb_error_name(ur));
             if (data->loop)
                 pw_main_loop_quit(data->loop);
             return;
@@ -272,21 +239,21 @@ static void on_state_changed(void *userdata, enum pw_stream_state old,
         usb_dev = open_ux2(usb_ctx);
         if (!usb_dev)
         {
-            fprintf(stderr, "[usb] apertura UX2 fallita anche a stream avviato\n");
+            fprintf(stderr, "[usb] cannot open UX2 device\n");
             if (data->loop)
                 pw_main_loop_quit(data->loop);
             return;
         }
-        fprintf(stderr, "[usb] UX2 aperta correttamente (VID=%04x PID=%04x)\n", VID, PID);
+        fprintf(stderr, "[usb] opened UX2 (VID=%04x PID=%04x)\n", VID, PID);
 
         atomic_store_explicit(&g_sender_started, 1, memory_order_relaxed);
         if (pthread_create(&data->sender_tid, NULL, vu_sender_thread, NULL) != 0)
         {
-            fprintf(stderr, "Impossibile creare il thread di invio USB\n");
+            fprintf(stderr, "Unable to create USB send thread\n");
         }
         else
         {
-            fprintf(stderr, "[usb] stream audio attivo, avvio invio comandi USB\n");
+            fprintf(stderr, "[usb] audio stream is active\n");
         }
     }
 }
@@ -298,28 +265,29 @@ static const struct pw_stream_events stream_events = {
 };
 
 /* ---------------------------------------------------------------------
- * Thread timer: ogni ~45ms preleva il picco, converte, manda via USB
+ * USB COMMUNICATION SECTION - Sends values to UX2
  * --------------------------------------------------------------------- */
 
-static void *vu_sender_thread(void *arg)
-{
+static void *vu_sender_thread(void *arg){
     (void)arg;
 
-    while (atomic_load_explicit(&g_running, memory_order_relaxed))
-    {
+    while (atomic_load_explicit(&g_running, memory_order_relaxed)){
+        //Calculates peak level
         float peak_l = atomic_exchange_explicit(&g_peak_left, 0.0f, memory_order_relaxed);
         float peak_r = atomic_exchange_explicit(&g_peak_right, 0.0f, memory_order_relaxed);
 
+        //Converts to dBs
         double dbfs_l = peak_to_dbfs(peak_l);
         double dbfs_r = peak_to_dbfs(peak_r);
 
+        //Converts to UX2 VU values
         int vu_l = dbfs_to_vu(dbfs_l);
         int vu_r = dbfs_to_vu(dbfs_r);
 
         int r1 = send_peak(usb_dev, 2);
         int r2 = send_vu(usb_dev, vu_l, vu_r);
 
-        /* DEBUG: stampa ogni tick */
+        /* DEBUG */
         /*
         fprintf(stderr,
                 "[usb] peak L=%.4f R=%.4f  dBFS L=%.1f R=%.1f  VU L=%d R=%d  "
@@ -332,6 +300,23 @@ static void *vu_sender_thread(void *arg)
     }
 
     return NULL;
+}
+
+//Shutdown task, sets meters to zero and removes clip indicator
+static void *vu_anim(){
+    int vu_l = 140;
+    int vu_r = 140;
+
+    int r1 = send_peak(usb_dev, 2);
+    usleep(1000 * 1000);
+    int r2 = send_vu(usb_dev, vu_l, vu_r);
+    usleep(1000);
+    int r3 = send_peak(usb_dev, 1);
+
+    fprintf(stderr,
+        "[usb] Started meters\n",
+        r1 == 0 ? "ok" : "FALLITA",
+        r2 == 0 ? "ok" : "FALLITA");
 }
 
 //Shutdown task, sets meters to zero and removes clip indicator
@@ -350,34 +335,28 @@ static void *vu_zero(){
 
 static struct pw_main_loop *g_pw_loop = NULL;
 
-static void handle_sigint(int sig)
-{
+/* ---------------------------------------------------------------------
+ * SIGNAL HANDLING - Stores int signal values into atomic
+ * --------------------------------------------------------------------- */
+
+static void handle_sigint(int sig){
     (void)sig;
     atomic_store_explicit(&g_running, 0, memory_order_relaxed);
-    if (g_pw_loop)
-    {
+    if (g_pw_loop){
         pw_main_loop_quit(g_pw_loop);
     }
 }
 
-int main(int argc, char *argv[])
-{
+int main(int argc, char *argv[]){
     struct pw_data data = {0};
     const struct spa_pod *params[1];
     uint8_t buffer[1024];
     struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
     int r;
 
-    /* NON inizializziamo libusb qui: anche solo libusb_init(), senza
-     * aprire alcun device, e' sufficiente a far fallire la
-     * negoziazione PipeWire/ALSA sulla UX2 (osservato empiricamente:
-     * errore "Host is down"/EHOSTDOWN). Rimandiamo TUTTO cio' che
-     * riguarda libusb a on_state_changed, quando lo stream audio e'
-     * gia' "streaming" e la negoziazione e' conclusa. */
-
     signal(SIGINT, handle_sigint);
 
-    /* --- init PipeWire --- */
+    //init PipeWire
     pw_init(&argc, &argv);
 
     data.loop = pw_main_loop_new(NULL);
@@ -413,8 +392,7 @@ int main(int argc, char *argv[])
             PW_STREAM_FLAG_RT_PROCESS,
         params, 1);
 
-    if (r < 0)
-    {
+    if (r < 0){
         fprintf(stderr, "[pipewire] pw_stream_connect fallito: %s (%d)\n",
                 spa_strerror(r), r);
         return 1;
@@ -427,11 +405,11 @@ int main(int argc, char *argv[])
     printf("In ascolto del monitor del sink di default. Ctrl+C per uscire.\n");
 
     pw_main_loop_run(data.loop);
+    //vu_anim();
 
     /* --- shutdown --- */
     atomic_store_explicit(&g_running, 0, memory_order_relaxed);
-    if (atomic_load_explicit(&g_sender_started, memory_order_relaxed))
-    {
+    if (atomic_load_explicit(&g_sender_started, memory_order_relaxed)){
         pthread_join(data.sender_tid, NULL);
     }
 
@@ -441,8 +419,7 @@ int main(int argc, char *argv[])
 
     vu_zero();
 
-    if (usb_dev)
-    {
+    if (usb_dev){
         libusb_close(usb_dev);
     }
     libusb_exit(usb_ctx);

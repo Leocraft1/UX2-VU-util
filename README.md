@@ -1,2 +1,3 @@
 # UX2-VU-util
-Utility for enabling VU Meter and Clip indicators on Line 6 "POD Studio UX2".
+
+This program enables control over the proprietary Line 6 POD Studio UX2 VU Meters and Clip indicators. But for now it's yet to be finished.

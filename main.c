@@ -50,20 +50,59 @@
 #define VU_MAX 140
 
 #define REF_RATE_MS 50
+#define RECONNECT_MS 500
 
 static libusb_context *usb_ctx = NULL;
-static libusb_device_handle *usb_dev = NULL;
 
-static libusb_device_handle *open_ux2(libusb_context *ctx){
-    libusb_device_handle *dev = libusb_open_device_with_vid_pid(ctx, VID, PID);
-    if (!dev)
+/* Looks for the UX2 on the bus and opens it. On failure returns NULL and
+ * stores the libusb error code in *err (LIBUSB_ERROR_NO_DEVICE if the card
+ * is simply not plugged in). */
+static libusb_device_handle *open_ux2(int *err){
+    libusb_device **list;
+    libusb_device_handle *handle = NULL;
+    int found = 0;
+    ssize_t n, i;
+
+    *err = 0;
+
+    n = libusb_get_device_list(usb_ctx, &list);
+    if (n < 0)
     {
-        fprintf(stderr, "Unable to open UX2 device (%04x:%04x)\n", VID, PID);
+        *err = (int)n;
         return NULL;
     }
-    return dev;
+
+    for (i = 0; i < n; i++)
+    {
+        struct libusb_device_descriptor desc;
+        int r;
+
+        if (libusb_get_device_descriptor(list[i], &desc) != 0)
+            continue;
+        if (desc.idVendor != VID || desc.idProduct != PID)
+            continue;
+
+        found = 1;
+        r = libusb_open(list[i], &handle);
+        if (r != 0)
+        {
+            handle = NULL;
+            *err = r;
+        }
+        break;
+    }
+
+    libusb_free_device_list(list, 1);
+
+    if (!found)
+        *err = LIBUSB_ERROR_NO_DEVICE;
+
+    return handle;
 }
 
+/* Both send functions return 0 on success or a negative libusb error code.
+ * They never print: the caller decides what to log, so a missing device
+ * does not flood the log with one message per transfer. */
 static int send_vu(libusb_device_handle *dev, int left, int right){
     uint16_t wIndex;
     int r;
@@ -80,27 +119,16 @@ static int send_vu(libusb_device_handle *dev, int left, int right){
         dev, BM_REQUEST_TYPE, B_REQUEST,
         VU_WVALUE, wIndex, NULL, 0, 1000);
 
-    if (r < 0)
-    {
-        fprintf(stderr, "VU: control transfer failed: %s (%d)\n",
-                libusb_error_name(r), r);
-        return -1;
-    }
-    return 0;
+    return r < 0 ? r : 0;
 }
 
-//Drives Clip LEDs
-static int send_peak(libusb_device_handle *dev, int val){
+//Drives Clip LEDs: 1=none 2=left 3=right 4=both
+static int send_clip(libusb_device_handle *dev, int val){
     int r = libusb_control_transfer(
         dev, BM_REQUEST_TYPE, B_REQUEST,
         CLIP_WVALUE, val, NULL, 0, 1000);
-    if (r < 0)
-    {
-        fprintf(stderr, "Clip LEDs: control transfer failed: %s (%d)\n",
-                libusb_error_name(r), r);
-        return -1;
-    }
-    return 0;
+
+    return r < 0 ? r : 0;
 }
 
 /* ---------------------------------------------------------------------
@@ -153,13 +181,7 @@ static void atomic_update_peak(_Atomic float *slot, float value){
 struct pw_data{
     struct pw_main_loop *loop;
     struct pw_stream *stream;
-    pthread_t sender_tid;
 };
-
-static _Atomic int g_sender_started = 0;
-
-static void *vu_sender_thread(void *arg);
-static void vu_anim(void);
 
 static uint64_t g_process_calls = 0;
 
@@ -218,45 +240,12 @@ static void on_process(void *userdata){
 }
 
 static void on_state_changed(void *userdata, enum pw_stream_state old, enum pw_stream_state state, const char *error){
-    struct pw_data *data = userdata;
     (void)userdata;
     fprintf(stderr, "[pipewire] stream state: %s -> %s%s%s\n",
         pw_stream_state_as_string(old),
         pw_stream_state_as_string(state),
         error ? "  ERROR: " : "",
         error ? error : "");
-
-    if (state == PW_STREAM_STATE_STREAMING && !atomic_load_explicit(&g_sender_started, memory_order_relaxed)){
-        int ur;
-
-        ur = libusb_init(&usb_ctx);
-        if (ur != 0){
-            fprintf(stderr, "libusb_init failed: %s\n", libusb_error_name(ur));
-            if (data->loop)
-                pw_main_loop_quit(data->loop);
-            return;
-        }
-
-        usb_dev = open_ux2(usb_ctx);
-        if (!usb_dev)
-        {
-            fprintf(stderr, "[usb] cannot open UX2 device\n");
-            if (data->loop)
-                pw_main_loop_quit(data->loop);
-            return;
-        }
-        fprintf(stderr, "[usb] opened UX2 (VID=%04x PID=%04x)\n", VID, PID);
-
-        atomic_store_explicit(&g_sender_started, 1, memory_order_relaxed);
-        if (pthread_create(&data->sender_tid, NULL, vu_sender_thread, NULL) != 0)
-        {
-            fprintf(stderr, "Unable to create USB send thread\n");
-        }
-        else
-        {
-            fprintf(stderr, "[usb] audio stream is active\n");
-        }
-    }
 }
 
 static const struct pw_stream_events stream_events = {
@@ -267,18 +256,63 @@ static const struct pw_stream_events stream_events = {
 
 /* ---------------------------------------------------------------------
  * USB COMMUNICATION SECTION - Sends values to UX2
+ *
+ * The USB thread owns the device handle. It is independent from the
+ * PipeWire stream: it waits for the UX2 to show up, plays the startup
+ * animation, sends levels, and goes back to waiting if the card is
+ * unplugged. Messages are logged only when the state changes.
  * --------------------------------------------------------------------- */
 
-static void *vu_sender_thread(void *arg){
+static void log_open_error(int err){
+    if (err == LIBUSB_ERROR_NO_DEVICE)
+        fprintf(stderr, "[usb] UX2 not found, waiting for it to be connected\n");
+    else if (err == LIBUSB_ERROR_ACCESS)
+        fprintf(stderr, "[usb] permission denied opening UX2 (check the udev rule), retrying\n");
+    else
+        fprintf(stderr, "[usb] cannot open UX2: %s, retrying\n", libusb_error_name(err));
+}
+
+// Startup animation: every clip LED on and both meters at full scale
+static void vu_anim(libusb_device_handle *dev){
+    send_clip(dev, 4);
+    send_vu(dev, VU_MAX, VU_MAX);
+
+    usleep(800 * 1000);
+
+    send_clip(dev, 1);
+    send_vu(dev, 0, 0);
+}
+
+/* Shutdown task: sets meters to zero and turns off the clip indicator */
+static void vu_zero(libusb_device_handle *dev){
+    send_clip(dev, 1);
+    send_vu(dev, 0, 0);
+}
+
+static void *usb_thread(void *arg){
+    libusb_device_handle *dev = NULL;
+    int last_err = 0; //last open error already logged
     (void)arg;
 
-    /* Startup animation runs once here: usb_dev is guaranteed valid at
-     * this point (this thread is only started after open_ux2()
-     * succeeded), and running it in this separate thread means it
-     * doesn't block the PipeWire main loop. */
-    vu_anim();
-
     while (atomic_load_explicit(&g_running, memory_order_relaxed)){
+        if (!dev){
+            int err;
+
+            dev = open_ux2(&err);
+            if (!dev){
+                if (err != last_err){
+                    log_open_error(err);
+                    last_err = err;
+                }
+                usleep(RECONNECT_MS * 1000);
+                continue;
+            }
+
+            last_err = 0;
+            fprintf(stderr, "[usb] UX2 connected (VID=%04x PID=%04x)\n", VID, PID);
+            vu_anim(dev);
+        }
+
         //Calculates peak level
         float peak_l = atomic_exchange_explicit(&g_peak_left, 0.0f, memory_order_relaxed);
         float peak_r = atomic_exchange_explicit(&g_peak_right, 0.0f, memory_order_relaxed);
@@ -300,44 +334,27 @@ static void *vu_sender_thread(void *arg){
         else if (clip_l)           clip_stat = 2;
         else                        clip_stat = 1;
 
-        send_peak(usb_dev, clip_stat);
-        send_vu(usb_dev, vu_l, vu_r);
+        int r1 = send_clip(dev, clip_stat);
+        int r2 = send_vu(dev, vu_l, vu_r);
+
+        if (r1 < 0 || r2 < 0){
+            fprintf(stderr, "[usb] UX2 lost (%s), waiting for it to come back\n",
+                    libusb_error_name(r1 < 0 ? r1 : r2));
+            libusb_close(dev);
+            dev = NULL;
+            last_err = LIBUSB_ERROR_NO_DEVICE; //already reported, do not repeat
+            continue;
+        }
 
         usleep(REF_RATE_MS * 1000);
     }
 
+    if (dev){
+        vu_zero(dev);
+        libusb_close(dev);
+    }
+
     return NULL;
-}
-
-// Startup animation
-static void vu_anim(void){
-    //Vu at max scale and all LED on
-    int r1 = send_peak(usb_dev, 4);
-    int r2 = send_vu(usb_dev, VU_MAX, VU_MAX);
-
-    usleep(800 * 1000);
-
-    //Turn everything off
-    int r3 = send_peak(usb_dev, 1);
-    int r4 = send_vu(usb_dev, 0, 0);
-
-    fprintf(stderr,
-        "[usb] Startup animation done (clip_on=%s vu_on=%s clip_off=%s vu_off=%s)\n",
-        r1 == 0 ? "ok" : "FAILED",
-        r2 == 0 ? "ok" : "FAILED",
-        r3 == 0 ? "ok" : "FAILED",
-        r4 == 0 ? "ok" : "FAILED");
-}
-
-/* Shutdown task: sets meters to zero and turns off the clip indicator */
-static void vu_zero(void){
-    int r1 = send_peak(usb_dev, 1);
-    int r2 = send_vu(usb_dev, 0, 0);
-
-    fprintf(stderr,
-        "[usb] Meters set to zero (clip=%s vu=%s)\n",
-        r1 == 0 ? "ok" : "FAILED",
-        r2 == 0 ? "ok" : "FAILED");
 }
 
 static struct pw_main_loop *g_pw_loop = NULL;
@@ -359,10 +376,17 @@ int main(int argc, char *argv[]){
     const struct spa_pod *params[1];
     uint8_t buffer[1024];
     struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+    pthread_t usb_tid;
     int r;
 
     signal(SIGINT, handle_sigint);
     signal(SIGTERM, handle_sigint);
+
+    r = libusb_init(&usb_ctx);
+    if (r != 0){
+        fprintf(stderr, "libusb_init failed: %s\n", libusb_error_name(r));
+        return 1;
+    }
 
     //init PipeWire
     pw_init(&argc, &argv);
@@ -405,30 +429,24 @@ int main(int argc, char *argv[]){
                 spa_strerror(r), r);
         return 1;
     }
-    fprintf(stderr, "[pipewire] pw_stream_connect call succeeded, "
-                    "waiting for stream to connect...\n");
 
-    /* the USB sender thread starts on its own once the PipeWire stream
-     * reaches STREAMING (see on_state_changed) */
+    if (pthread_create(&usb_tid, NULL, usb_thread, NULL) != 0){
+        fprintf(stderr, "Unable to create USB thread\n");
+        return 1;
+    }
+
     printf("Listening to default sink monitor. Press Ctrl+C to exit.\n");
 
     pw_main_loop_run(data.loop);
 
     /* --- shutdown --- */
     atomic_store_explicit(&g_running, 0, memory_order_relaxed);
-    if (atomic_load_explicit(&g_sender_started, memory_order_relaxed)){
-        pthread_join(data.sender_tid, NULL);
-    }
+    pthread_join(usb_tid, NULL); //zeroes the meters and closes the UX2
 
     pw_stream_destroy(data.stream);
     pw_main_loop_destroy(data.loop);
     pw_deinit();
 
-    vu_zero();
-
-    if (usb_dev){
-        libusb_close(usb_dev);
-    }
     libusb_exit(usb_ctx);
 
     return 0;

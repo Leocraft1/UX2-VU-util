@@ -55,4 +55,3 @@ dkms.conf
 *.dwo
 
 # Binary
-ux2_vu_daemon
